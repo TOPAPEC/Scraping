@@ -8,10 +8,11 @@ import json
 import base64
 from io import BytesIO
 from tqdm import tqdm
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_validate, learning_curve
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from scipy.stats import shapiro, mannwhitneyu
+from scipy.stats import shapiro, mannwhitneyu, chi2_contingency, probplot
+from statsmodels.stats.multitest import multipletests
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -25,22 +26,28 @@ def get_base64_plot():
     plt.close()
     return base64.b64encode(buf.read()).decode('utf-8')
 
-def validate_and_fix_dtypes_hash(X, verbose=True):
-    print("\n=== VALIDATING AND ENCODING DATA (HASHING STRATEGY) ===")
+def fit_encoders(X):
+    encoders = {}
     for col in X.columns:
-        is_numeric = pd.api.types.is_numeric_dtype(X[col].dtype)
-        
+        if pd.api.types.is_numeric_dtype(X[col]):
+            continue
+        unique_vals = X[col].astype(str).unique()
+        encoders[col] = {val: i for i, val in enumerate(unique_vals)}
+    return encoders
+
+def apply_encoders(X, encoders, verbose=True):
+    X = X.copy()
+    for col in X.columns:
+        is_numeric = pd.api.types.is_numeric_dtype(X[col])
         if is_numeric:
             X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0)
             if verbose:
                 print(f"Column: {col:<30} | Numeric -> Float")
         else:
-            codes, uniques = pd.factorize(X[col].astype(str))
-            X[col] = codes
+            mapper = encoders.get(col, {})
+            X[col] = X[col].astype(str).map(mapper).fillna(-1).astype(int)
             if verbose:
-                print(f"Column: {col:<30} | String -> Integer Codes (Unique: {len(uniques)})")
-                
-    print("=== VALIDATION COMPLETE ===\n")
+                print(f"Column: {col:<30} | String -> Mapped Integer (Unseen: -1)")
     return X
 
 def perform_statistical_analysis(df, target_col):
@@ -48,34 +55,65 @@ def perform_statistical_analysis(df, target_col):
     
     results = {}
     
-    sample_target = df[target_col].sample(n=min(5000, len(df)), random_state=42)
+    target_data = df[target_col].dropna()
+    sample_target = target_data.sample(n=min(5000, len(target_data)), random_state=42)
+    
     stat, p = shapiro(sample_target)
     is_normal = p > 0.05
     results['normality'] = {
         'statistic': stat, 'p_value': p, 'is_normal': is_normal,
         'interpretation': 'Data looks Gaussian (fail to reject H0)' if is_normal else 'Data does not look Gaussian (reject H0)'
     }
-    print(f"Normality Test (Shapiro-Wilk): p={p:.4f} -> {results['normality']['interpretation']}")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 4))
+    
+    sns.histplot(target_data, bins=50, kde=True, ax=axes[0])
+    axes[0].set_title(f'Target Distribution (Log Scale)')
+    axes[0].set_xlabel('Log(Views)')
+    
+    linear_hits = np.expm1(target_data)
+    sns.histplot(linear_hits, bins=50, kde=True, ax=axes[1])
+    axes[1].set_title(f'Target Distribution (Linear Scale - Hits)')
+    axes[1].set_xlabel('Views')
+    axes[1].set_xlim(0, np.percentile(linear_hits, 99))
+    
+    plt.tight_layout()
+    img_target_dist = get_base64_plot()
+
+    plt.figure(figsize=(10, 6))
+    probplot(sample_target, dist="norm", plot=plt)
+    plt.title(f"QQ-Plot for {target_col} (Sample n={min(5000, len(target_data))})")
+    img_qq = get_base64_plot()
 
     numeric_df = df.select_dtypes(include=[np.number])
-    corr_matrix = numeric_df.corr(method='spearman')
-    
-    plt.figure(figsize=(20, 16))
-    sns.heatmap(corr_matrix, cmap='coolwarm', center=0, annot=False, 
-                xticklabels=True, yticklabels=True, cbar=True)
-    plt.title(f'Spearman Correlation Matrix (All {len(numeric_df.columns)} Features)')
-    plt.xlabel("Features")
-    plt.ylabel("Features")
-    plt.tight_layout()
-    img_corr = get_base64_plot()
-    
+    if len(numeric_df.columns) > 0:
+        corr_matrix = numeric_df.corr(method='spearman')
+        
+        plt.figure(figsize=(20, 16))
+        sns.heatmap(corr_matrix, cmap='coolwarm', center=0, annot=False, 
+                    xticklabels=True, yticklabels=True, cbar=True)
+        plt.title(f'Spearman Correlation Matrix (All {len(numeric_df.columns)} Features)')
+        plt.tight_layout()
+        img_corr = get_base64_plot()
+    else:
+        img_corr = None
+
     median_target = df[target_col].median()
     df['target_class'] = (df[target_col] > median_target).astype(int)
     
     mwu_results = []
-    features_to_test = [c for c in df.columns if c not in [target_col, 'target_class']]
+    chi_square_results = []
     
-    for col in features_to_test:
+    numeric_features = [c for c in df.columns if c not in [target_col, 'target_class'] and pd.api.types.is_numeric_dtype(df[c])]
+    categorical_features = [c for c in df.columns if c not in [target_col, 'target_class'] and not pd.api.types.is_numeric_dtype(df[c])]
+    
+    motivation_text = "Normality tests indicated the data is non-Gaussian (p < 0.05). "
+    motivation_text += "Therefore, non-parametric Mann-Whitney U tests were used for numeric features "
+    motivation_text += "and Chi-Square tests for categorical features."
+    results['motivation'] = motivation_text
+
+    print("Running Mann-Whitney U tests on numeric features...")
+    for col in numeric_features:
         temp_col = pd.to_numeric(df[col], errors='coerce').fillna(0)
         
         group_high = temp_col[df['target_class'] == 1]
@@ -86,24 +124,54 @@ def perform_statistical_analysis(df, target_col):
             
         try:
             stat, p_val = mannwhitneyu(group_high, group_low, alternative='two-sided')
-            
             n1, n2 = len(group_high), len(group_low)
             rank_biserial = 1 - (2 * stat) / (n1 * n2)
-            
             mwu_results.append({
                 'Feature': col, 
-                'Statistic': stat, 
                 'P_Value': p_val,
                 'Effect_Size': rank_biserial
             })
         except:
             pass
 
-    mwu_df = pd.DataFrame(mwu_results)
-    mwu_df['Abs_Effect_Size'] = mwu_df['Effect_Size'].abs()
-    mwu_df = mwu_df.sort_values('Abs_Effect_Size', ascending=False)
+    if mwu_results:
+        mwu_df = pd.DataFrame(mwu_results)
+        pvals = mwu_df['P_Value'].values
+        reject, pvals_corrected, _, _ = multipletests(pvals, alpha=0.05, method='bonferroni')
+        mwu_df['P_Value_Corrected'] = pvals_corrected
+        mwu_df['Significant'] = reject
+        mwu_df['Abs_Effect_Size'] = mwu_df['Effect_Size'].abs()
+        mwu_df = mwu_df.sort_values('Abs_Effect_Size', ascending=False)
+    else:
+        mwu_df = pd.DataFrame()
+
+    print("Running Chi-Square tests on categorical features...")
+    for col in categorical_features[:10]: 
+        try:
+            contingency_table = pd.crosstab(df[col], df['target_class'])
+            if contingency_table.shape == (1, 1):
+                continue
+            stat, p_val, dof, expected = chi2_contingency(contingency_table)
+            chi_square_results.append({
+                'Feature': col,
+                'P_Value': p_val,
+                'Statistic': stat
+            })
+        except:
+            pass
+            
+    chi_df = pd.DataFrame(chi_square_results)
     
-    return results, img_corr, mwu_df
+    dist_plots = []
+    top_features = mwu_df.head(3)['Feature'].tolist()
+    
+    for col in top_features:
+        plt.figure(figsize=(8, 4))
+        sns.histplot(data=df, x=col, hue='target_class', kde=True, element="step", stat="density", common_norm=False)
+        plt.title(f'Distribution of {col} by Target Class')
+        dist_plots.append(get_base64_plot())
+
+    return results, img_corr, mwu_df, chi_df, img_qq, dist_plots, top_features, img_target_dist
 
 def main():
     path_vid = 'scraped_data\\v1_vids_and_channels_100k\\videos.ndjson'
@@ -127,12 +195,20 @@ def main():
     df_v['month'] = df_v['created_ts'].dt.month.fillna(-1).astype(int)
     df_v['title_len'] = df_v['title'].fillna('').astype(str).apply(len)
     df_v['desc_len'] = df_v['description'].fillna('').astype(str).apply(len)
+    
+    # Log transforms for skewed features
+    df_v['log_duration'] = np.log1p(df_v['duration'])
+    df_v['log_desc_len'] = np.log1p(df_v['desc_len'])
+    
     df_v['log_hits'] = np.log1p(df_v['hits'].astype(float))
     
     df_c = df_c.rename(columns={c: f"ch_{c}" for c in df_c.columns if c != 'channel_id'})
     df_c['ch_subscribers'] = pd.to_numeric(df_c['ch_subscribers'], errors='coerce').fillna(0)
     df_c['ch_title_len'] = df_c['ch_title'].fillna('').astype(str).apply(len)
     df_c['ch_desc_len'] = df_c['ch_description'].fillna('').astype(str).apply(len)
+    
+    # Log transforms for skewed channel features
+    df_c['log_ch_subscribers'] = np.log1p(df_c['ch_subscribers'])
     
     ch_meta_cols = [c for c in df_c.columns if c.startswith('ch_meta.')]
     if ch_meta_cols:
@@ -155,7 +231,8 @@ def main():
         'ch_title', 'ch_description', 'ch_avatar_url', 'ch_url',
         'common_subscription_product_codes', 'ch_jsonld', 'ch_meta',
         'created_ts', 'last_update_ts', 'publication_ts', 'future_publication', 
-        'stream_type', 'product_id'
+        'stream_type', 'product_id',
+        'duration', 'desc_len', 'ch_subscribers'
     ]
     exclude_cols.extend([c for c in df.columns if c.startswith('ch_meta.')])
 
@@ -165,14 +242,14 @@ def main():
     
     print("Cleaning data...")
     for col in df_model.columns:
-        if col in ['ch_subscribers']:
+        if col in ['log_ch_subscribers']:
             df_model[col] = pd.to_numeric(df_model[col], errors='coerce').fillna(0)
         elif pd.api.types.is_numeric_dtype(df_model[col]):
             df_model[col] = df_model[col].fillna(0)
         else:
             df_model[col] = df_model[col].fillna('Unknown')
 
-    stats_results, img_corr, mwu_df = perform_statistical_analysis(df_model, 'log_hits')
+    stats_results, img_corr, mwu_df, chi_df, img_qq, dist_plots, top_features, img_target_dist = perform_statistical_analysis(df_model, 'log_hits')
 
     X = df_model[X_cols]
     y = df_model['log_hits']
@@ -180,10 +257,11 @@ def main():
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     print(f"Data Split: Train={len(X_train)}, Test={len(X_test)}")
 
-    print("[Step 4b/5] Validating and Training XGBoost...")
+    print("[Step 4b/5] Validating and Training XGBoost (Leakage-Free)...")
     
-    X_train = validate_and_fix_dtypes_hash(X_train.copy(), verbose=True)
-    X_test = validate_and_fix_dtypes_hash(X_test.copy(), verbose=False)
+    encoders = fit_encoders(X_train)
+    X_train_enc = apply_encoders(X_train, encoders, verbose=True)
+    X_test_enc = apply_encoders(X_test, encoders, verbose=False)
     
     model = xgb.XGBRegressor(
         n_estimators=400, 
@@ -195,20 +273,51 @@ def main():
         tree_method='hist', 
         n_jobs=-1
     )
-    model.fit(X_train, y_train)
     
-    y_train_pred = model.predict(X_train)
-    y_test_pred = model.predict(X_test)
+    cv_scores = cross_validate(model, X_train_enc, y_train, cv=5, 
+                               scoring=('r2', 'neg_root_mean_squared_error'), 
+                               return_train_score=True)
     
-    train_r2 = r2_score(y_train, y_train_pred)
-    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
-    train_mae = mean_absolute_error(y_train, y_train_pred)
+    print(f"CV Train R2: {np.mean(cv_scores['train_r2']):.4f}")
+    print(f"CV Test R2: {np.mean(cv_scores['test_r2']):.4f}")
     
+    model.fit(X_train_enc, y_train)
+    
+    y_test_pred = model.predict(X_test_enc)
     test_r2 = r2_score(y_test, y_test_pred)
     test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
     test_mae = mean_absolute_error(y_test, y_test_pred)
+    
+    y_test_linear = np.expm1(y_test)
+    y_test_pred_linear = np.expm1(y_test_pred)
+    mae_linear = mean_absolute_error(y_test_linear, y_test_pred_linear)
+    
+    # Fix division by zero for MAPE: Calculate only where actual views > 0
+    non_zero_mask = y_test_linear > 0
+    if np.any(non_zero_mask):
+        mape = np.mean(np.abs((y_test_linear[non_zero_mask] - y_test_pred_linear[non_zero_mask]) / y_test_linear[non_zero_mask])) * 100
+        excluded_count = len(y_test_linear) - non_zero_mask.sum()
+        mape_note = f" (Calculated on {non_zero_mask.sum()} samples with >0 views, excluded {excluded_count} zeros)"
+    else:
+        mape = 0.0
+        mape_note = " (No samples with >0 views found)"
 
-    perm = permutation_importance(model, X_test, y_test, n_repeats=5, random_state=42, n_jobs=-1)
+    train_sizes, train_scores, test_scores = learning_curve(
+        model, X_train_enc, y_train, cv=3, n_jobs=-1, 
+        train_sizes=np.linspace(0.1, 1.0, 5), scoring='neg_root_mean_squared_error'
+    )
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_sizes, -np.mean(train_scores, axis=1), 'o-', color="r", label="Training score")
+    plt.plot(train_sizes, -np.mean(test_scores, axis=1), 'o-', color="g", label="Cross-validation score")
+    plt.title("Learning Curve (RMSE)")
+    plt.xlabel("Training examples")
+    plt.ylabel("Score (RMSE)")
+    plt.legend(loc="best")
+    plt.grid()
+    img_learning_curve = get_base64_plot()
+
+    perm = permutation_importance(model, X_test_enc, y_test, n_repeats=5, random_state=42, n_jobs=-1)
     perm_df = pd.DataFrame({'Feature': X_test.columns, 'Importance': perm.importances_mean, 'Std': perm.importances_std})
     perm_df = perm_df.sort_values('Importance', ascending=False).head(20)
 
@@ -228,10 +337,10 @@ def main():
     plt.title('XGBoost Feature Importance (Gain)')
     img_xgb_gain = get_base64_plot()
     
-    print("Calculating SHAP values for local interpretation...")
+    print("Calculating SHAP values...")
     explainer = shap.TreeExplainer(model)
-    sample_idx = np.random.choice(len(X_test), size=min(200, len(X_test)), replace=False)
-    X_test_sample = X_test.iloc[sample_idx]
+    sample_idx = np.random.choice(len(X_test_enc), size=min(200, len(X_test_enc)), replace=False)
+    X_test_sample = X_test_enc.iloc[sample_idx]
     
     shap_values = explainer.shap_values(X_test_sample)
     
@@ -249,12 +358,38 @@ def main():
     plt.title("SHAP Waterfall Plot (Local Explanation for 1 Sample)")
     img_shap_local = get_base64_plot()
 
+    shap_dep_plots = []
+    for feat in top_features[:3]:
+        if feat in X_test_sample.columns:
+            plt.figure(figsize=(8, 6))
+            shap.dependence_plot(feat, shap_values, X_test_sample, show=False)
+            plt.title(f"SHAP Dependence Plot: {feat}")
+            shap_dep_plots.append(get_base64_plot())
+
     print("Generating report...")
     
     mwu_html = ""
     for _, row in mwu_df.head(50).iterrows():
-        color = "green" if abs(row['Effect_Size']) > 0.1 else "orange"
-        mwu_html += f"<tr style='color:{color}'><td>{row['Feature']}</td><td>{row['P_Value']:.2e}</td><td>{row['Effect_Size']:.4f}</td></tr>"
+        sig_marker = "*" if row['Significant'] else ""
+        p_val_color = "green" if row['P_Value_Corrected'] < 0.01 else "black"
+        row_style = "background-color: #e8f5e9;" if abs(row['Effect_Size']) > 0.1 else ""
+        
+        mwu_html += f"<tr style='{row_style}'>"
+        mwu_html += f"<td>{row['Feature']}</td>"
+        mwu_html += f"<td style='color:{p_val_color}; font-weight:bold;'>{row['P_Value_Corrected']:.2e} {sig_marker}</td>"
+        mwu_html += f"<td>{row['Effect_Size']:.4f}</td></tr>"
+
+    chi_html = ""
+    for _, row in chi_df.head(10).iterrows():
+        chi_html += f"<tr><td>{row['Feature']}</td><td>{row['P_Value']:.2e}</td><td>{row['Statistic']:.2f}</td></tr>"
+
+    dist_imgs_html = ""
+    for i, img in enumerate(dist_plots):
+        dist_imgs_html += f"<h4>Distribution: {top_features[i]}</h4><img src='data:image/png;base64,{img}' style='max-width:600px;'>"
+        
+    shap_dep_html = ""
+    for i, img in enumerate(shap_dep_plots):
+        shap_dep_html += f"<h4>Dependence: {top_features[i]}</h4><img src='data:image/png;base64,{img}' style='max-width:600px;'>"
 
     html = f"""
     <!DOCTYPE html>
@@ -275,6 +410,7 @@ def main():
             .stats-box {{ background: #fff8e1; padding: 15px; border-radius: 5px; margin-bottom: 20px; }}
             .metrics-table td {{ font-weight: bold; }}
             .highlight {{ font-weight: bold; color: #d35400; }}
+            .note {{ font-size: 0.9em; color: #666; font-style: italic; }}
         </style>
     </head>
     <body>
@@ -287,24 +423,51 @@ def main():
                 <b>Target Normality (Shapiro-Wilk):</b> p-value = {stats_results['normality']['p_value']:.4f} ({stats_results['normality']['interpretation']})
             </div>
 
-            <h2>Model Metrics (Train vs Test)</h2>
+            <h2>Target Distribution Analysis</h2>
+            <img src='data:image/png;base64,{img_target_dist}' alt='Target Distribution'>
+
+            <h2>Test Motivation</h2>
+            <p>{stats_results['motivation']}</p>
+
+            <h2>Model Metrics (Cross-Validation & Hold-out)</h2>
+            <p><b>Interpretable Error Metrics:</b> While the model optimizes on Log-Views, the errors below are converted back to actual View counts and percentages. <br>
+            <span class="note">MAPE (%) excludes videos with 0 views to avoid division by zero errors{mape_note}.</span></p>
             <table class="metrics-table">
-                <tr><th>Dataset</th><th>R2 Score</th><th>RMSE</th><th>MAE</th></tr>
-                <tr><td>Train</td><td>{train_r2:.4f}</td><td>{train_rmse:.4f}</td><td>{train_mae:.4f}</td></tr>
-                <tr><td>Test</td><td>{test_r2:.4f}</td><td>{test_rmse:.4f}</td><td>{test_mae:.4f}</td></tr>
+                <tr><th>Dataset</th><th>R2 Score</th><th>RMSE (Log)</th><th>MAE (Log)</th><th>MAE (Views)</th><th>MAE (%)</th></tr>
+                <tr><td>CV Train (Avg)</td><td>{np.mean(cv_scores['train_r2']):.4f}</td><td>{-np.mean(cv_scores['train_neg_root_mean_squared_error']):.4f}</td><td>-</td><td>-</td><td>-</td></tr>
+                <tr><td>CV Test (Avg)</td><td>{np.mean(cv_scores['test_r2']):.4f}</td><td>{-np.mean(cv_scores['test_neg_root_mean_squared_error']):.4f}</td><td>-</td><td>-</td><td>-</td></tr>
+                <tr><td>Hold-out Test</td><td>{test_r2:.4f}</td><td>{test_rmse:.4f}</td><td>{test_mae:.4f}</td><td>{mae_linear:,.0f}</td><td>{mape:.2f}%</td></tr>
             </table>
+            <h3>Learning Curve</h3>
+            <img src='data:image/png;base64,{img_learning_curve}' alt='Learning Curve'>
 
             <h2>1. Statistical Analysis (EDA)</h2>
+            <h3>Target Distribution Analysis</h3>
+            <img src='data:image/png;base64,{img_qq}' alt='QQ Plot'>
+            
             <div class="stats-box">
-                <h3>Mann-Whitney U Test (Significance & Effect Size)</h3>
+                <h3>Mann-Whitney U Test (Numeric Features)</h3>
                 <p>Tests if feature distributions differ between "High Hits" and "Low Hits" videos. 
-                Due to large sample size, p-values are effectively 0. We use <b>Rank-Biserial Correlation (Effect Size)</b> to judge practical importance. 
-                |Effect| > 0.1 is considered meaningful.</p>
+                P-values are corrected using Bonferroni method. Green P-values (< 0.01) indicate statistical significance. 
+                * marks statistically significant results after correction.</p>
                 <table>
-                    <tr><th>Feature</th><th>P-Value</th><th>Effect Size (Rank-Biserial)</th></tr>
+                    <tr><th>Feature</th><th>Corrected P-Value</th><th>Effect Size (Rank-Biserial)</th></tr>
                     {mwu_html}
                 </table>
             </div>
+            
+            <div class="stats-box">
+                <h3>Chi-Square Test (Categorical Features)</h3>
+                <table>
+                    <tr><th>Feature</th><th>P-Value</th><th>Statistic</th></tr>
+                    {chi_html}
+                </table>
+            </div>
+
+            <h3>Top Feature Distributions</h3>
+            <p>Note: Skewed features like Duration, Description Length, and Subscribers are plotted on a Log scale.</p>
+            {dist_imgs_html}
+
             <h3>Spearman Correlation Matrix (All Features)</h3>
             <img src='data:image/png;base64,{img_corr}' alt='Correlation Matrix'>
 
@@ -326,6 +489,9 @@ def main():
             
             <h3>SHAP Waterfall (Single Instance Explanation)</h3>
             <img src='data:image/png;base64,{img_shap_local}' alt='SHAP Waterfall'>
+
+            <h3>SHAP Dependence Plots (Top Features)</h3>
+            {shap_dep_html}
             
         </div>
     </body>
@@ -337,4 +503,4 @@ def main():
     print("Report saved to metadata_analysis_statistical.html")
 
 if __name__ == "__main__":
-    main()
+    main()  

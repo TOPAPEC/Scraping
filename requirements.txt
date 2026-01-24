@@ -5,3 +5,4 @@ xgboost
 shap 
 seaborn 
 pandas
+statsmodels
