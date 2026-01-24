@@ -49,7 +49,7 @@ streamlit run streamlit/app.py
 
 Notes
 
-    Default target is hits (change via --target in analysis/train scripts if needed).
+Default target is hits (change via --target in analysis/train scripts if needed).
 
-    Holdout split is time-based (by publication_ts else created_ts), and is saved as models/holdout.parquet + models/split.json.
+Holdout split is time-based (by publication_ts else created_ts), and is saved as models/holdout.parquet + models/split.json.
 
