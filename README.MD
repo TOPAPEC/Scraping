@@ -13,6 +13,8 @@
 - `eda/` - data analysis code v2_cosmetics.py is the final version
 - `catboost_info/` — optional outputs/logs
 - `scraper/` — scraping code
+- folding - cv code
+- hyperparams - hp search 
 
 ## Setup
 
