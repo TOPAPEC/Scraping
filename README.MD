@@ -1,4 +1,3 @@
-# ML Models Playground (FastAPI + Streamlit)
 
 ## Repo structure
 
