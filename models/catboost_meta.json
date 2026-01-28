@@ -1,0 +1,52 @@
+{
+  "expects_scaled_numeric": false,
+  "numeric": [
+    "action_reason.id",
+    "common_subscription_product_codes_len",
+    "created_dow",
+    "created_hour",
+    "created_month",
+    "description_len",
+    "duration",
+    "pg_rating.age",
+    "publication_dow",
+    "publication_hour",
+    "publication_month",
+    "title_len"
+  ],
+  "bool": [
+    "author.is_allowed_offline",
+    "is_adult",
+    "is_audio",
+    "is_classic",
+    "is_club",
+    "is_hidden",
+    "is_licensed",
+    "is_livestream",
+    "is_official",
+    "is_on_air",
+    "is_original_content",
+    "is_original_sticker_2x2",
+    "is_paid",
+    "is_reborn_channel",
+    "kind_sign_for_user"
+  ],
+  "categorical": [
+    "action_reason.name",
+    "author.id",
+    "category.id",
+    "category.name",
+    "feed_name",
+    "origin_type",
+    "stream_type"
+  ],
+  "cat_feature_indices": [
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33
+  ]
+}

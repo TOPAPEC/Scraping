@@ -1,0 +1,6 @@
+{
+  "method": "time",
+  "time_col": "publication_ts",
+  "test_size": 0.2,
+  "cutoff_min_in_test": "2026-01-15 11:33:41"
+}
